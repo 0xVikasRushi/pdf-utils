@@ -144,16 +144,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pan_card_pdf() {
-        let pdf_path = "/Users/vikasrushi/pdf-utils/sample-pdfs/pan-cert.pdf";
+    fn test_valid_signature() {
+        let pdf_path = "/Users/vikasrushi/pdf-utils/sample-pdfs/digitally_signed.pdf";
         let (is_valid, message) = verify_pdf_signature(pdf_path);
         assert!(is_valid, "{:?}", message);
     }
 
     #[test]
-    fn test_bank_cert_pdf() {
-        let pdf_path = "/Users/vikasrushi/pdf-utils/sample-pdfs/bank-cert.pdf";
-        let (is_valid, message) = verify_pdf_signature(pdf_path);
+    fn test_digilocker_documents() {
+        let pan_card_pdf_path = "/Users/vikasrushi/pdf-utils/samples-private/pan-cert.pdf";
+        let bank_pdf_path = "/Users/vikasrushi/pdf-utils/samples-private/bank-cert.pdf";
+
+        let (is_valid, message) = verify_pdf_signature(pan_card_pdf_path);
+        assert!(is_valid, "{:?}", message);
+
+        let (is_valid, message) = verify_pdf_signature(bank_pdf_path);
         assert!(is_valid, "{:?}", message);
     }
 }
