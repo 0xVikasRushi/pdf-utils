@@ -1,6 +1,6 @@
 use std::str;
 
-pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
+pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
     // Step 1: Find /ByteRange [
     let br_pos = pdf_bytes
         .windows(b"/ByteRange".len())
@@ -112,7 +112,7 @@ pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
         signature_der.pop();
     }
 
-    Ok(signature_der)
+    Ok((signature_der, signed_data))
 }
 
 #[cfg(test)]
@@ -124,7 +124,7 @@ mod tests {
     fn test_valid_signature() {
         let pdf_bytes =
             fs::read("../sample-pdfs/digitally_signed.pdf").expect("Failed to read PDF file");
-        let signature_der = get_signature_der(&pdf_bytes).expect("Failed to get signed data");
+        let (signature_der, _) = get_signature_der(&pdf_bytes).expect("Failed to get signed data");
 
         let expected_signature_bytes = fs::read("../sample-pdfs/digitally_signed_ber.txt")
             .expect("Failed to read expected signature DER file");
