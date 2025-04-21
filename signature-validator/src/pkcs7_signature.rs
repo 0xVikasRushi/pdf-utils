@@ -4,7 +4,7 @@ use simple_asn1::{from_der, oid, ASN1Block, ASN1Class, OID};
 
 pub struct SignedDataInfo {
     pub modulus: String,
-    pub exponent: String,
+    pub exponent: BigUint,
     pub signature: String,
     pub algorithm: String,
 }
@@ -24,7 +24,7 @@ pub fn parse_signed_data(der_bytes: &[u8]) -> Result<SignedDataInfo, String> {
 
     Ok(SignedDataInfo {
         modulus: encode(&modulus_bytes),
-        exponent: exponent_big.to_string(),
+        exponent: exponent_big,
         signature,
         algorithm: alg_name.to_string(),
     })
@@ -254,8 +254,8 @@ mod tests {
     use std::fs;
 
     use crate::{
-        get_signature_der,
         pkcs7_signature::{parse_signed_data, SignedDataInfo},
+        signed_bytes_extractor::get_signature_der,
     };
 
     #[test]
