@@ -2,108 +2,69 @@ use std::str;
 pub mod pkcs7_signature;
 
 pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
-    // Step 1: Find /ByteRange [
+    // 1) Locate the /ByteRange[...] and extract the inner ASCII slice
     let br_pos = pdf_bytes
         .windows(b"/ByteRange".len())
         .position(|w| w == b"/ByteRange")
         .ok_or("ByteRange not found")?;
-
-    // Step 2: Find [ and ] after /ByteRange
-    let start_bracket = pdf_bytes[br_pos..]
+    let br_start = pdf_bytes[br_pos..]
         .iter()
         .position(|&b| b == b'[')
-        .ok_or("ByteRange [ not found")?
+        .ok_or("ByteRange '[' not found")?
         + br_pos
         + 1;
-
-    let end_bracket = pdf_bytes[start_bracket..]
+    let br_end = pdf_bytes[br_start..]
         .iter()
         .position(|&b| b == b']')
-        .ok_or("ByteRange ] not found")?
-        + start_bracket;
+        .ok_or("ByteRange ']' not found")?
+        + br_start;
+    let br_str =
+        str::from_utf8(&pdf_bytes[br_start..br_end]).map_err(|_| "Invalid ByteRange data")?;
 
-    let br_slice = &pdf_bytes[start_bracket..end_bracket];
-
-    // Step 3: Parse 4 numbers inside ByteRange
-    let mut nums = [0usize; 4];
-    let mut current = 0usize;
-    let mut idx = 0;
-    let mut in_number = false;
-
-    for &b in br_slice {
-        if b.is_ascii_digit() {
-            in_number = true;
-            current = current * 10 + (b - b'0') as usize;
-        } else if in_number {
-            if idx >= 4 {
-                break;
-            }
-            nums[idx] = current;
-            idx += 1;
-            current = 0;
-            in_number = false;
-        }
-    }
-    if in_number && idx < 4 {
-        nums[idx] = current;
-        idx += 1;
-    }
-
-    if idx != 4 {
+    // 2) Parse exactly four usize values
+    let nums: Vec<usize> = br_str
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .take(4)
+        .collect();
+    if nums.len() != 4 {
         return Err("Expected exactly 4 numbers inside ByteRange");
     }
+    let [offset1, len1, offset2, len2] = [nums[0], nums[1], nums[2], nums[3]];
 
-    let [offset1, len1, offset2, len2] = nums;
-
-    // Step 4: Basic boundary checks
+    // 3) Boundary check
     if offset1 + len1 > pdf_bytes.len() || offset2 + len2 > pdf_bytes.len() {
         return Err("ByteRange values out of bounds");
     }
 
-    // Step 5: Reconstruct signed data
+    // 4) Reconstruct the signed_data
     let mut signed_data = Vec::with_capacity(len1 + len2);
     signed_data.extend_from_slice(&pdf_bytes[offset1..offset1 + len1]);
     signed_data.extend_from_slice(&pdf_bytes[offset2..offset2 + len2]);
 
-    // Step 6: Find /Contents
-    let contents_marker = b"/Contents";
+    // 5) Locate the /Contents<...> hex blob
     let contents_pos = pdf_bytes[br_pos..]
-        .windows(contents_marker.len())
-        .position(|w| w == contents_marker)
+        .windows(b"/Contents".len())
+        .position(|w| w == b"/Contents")
         .ok_or("Contents not found after ByteRange")?
         + br_pos;
-
-    let start = pdf_bytes[contents_pos..]
+    let hex_start = pdf_bytes[contents_pos..]
         .iter()
         .position(|&b| b == b'<')
         .ok_or("Start '<' not found after Contents")?
         + contents_pos
         + 1;
-
-    let end = pdf_bytes[start..]
+    let hex_end = pdf_bytes[hex_start..]
         .iter()
         .position(|&b| b == b'>')
         .ok_or("End '>' not found after Contents")?
-        + start;
+        + hex_start;
 
-    let hex_data = &pdf_bytes[start..end];
-    let mut signature_der = Vec::with_capacity(hex_data.len() / 2);
-    let mut byte = 0_u8;
-    for (i, &h) in hex_data.iter().enumerate() {
-        let val = match h {
-            b'0'..=b'9' => h - b'0',
-            b'A'..=b'F' => h - b'A' + 10,
-            b'a'..=b'f' => h - b'a' + 10,
-            _ => return Err("Contents hex parse error"),
-        };
-        if i % 2 == 0 {
-            byte = val << 4;
-        } else {
-            byte |= val;
-            signature_der.push(byte);
-        }
-    }
-    while let Some(&0) = signature_der.last() {
+    // 6) Decode the hex into DER bytes, stripping any trailing zero padding
+    let hex_str =
+        str::from_utf8(&pdf_bytes[hex_start..hex_end]).map_err(|_| "Invalid hex in Contents")?;
+    let mut signature_der = hex::decode(hex_str).map_err(|_| "Contents hex parse error")?;
+    while signature_der.last() == Some(&0) {
         signature_der.pop();
     }
 
@@ -112,12 +73,11 @@ pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'stati
 
 #[cfg(test)]
 mod tests {
-    use sha1::Digest;
-
     use super::*;
+    use sha1::Digest;
     use std::fs;
 
-    // #[test]
+    #[test]
     fn test_valid_signature() {
         let pdf_bytes =
             fs::read("../sample-pdfs/digitally_signed.pdf").expect("Failed to read PDF file");
@@ -137,6 +97,11 @@ mod tests {
         let hash = hasher.finalize();
         dbg!(hex::encode(&hash));
 
-        assert_eq!(expected_signature, hex::encode(&signature_der))
+        assert_eq!(
+            hex::encode(&hash).to_string(),
+            "3f0047e6cb5b9bb089254b20d174445c3ba4f513"
+        );
+
+        assert_eq!(expected_signature, hex::encode(&signature_der));
     }
 }
