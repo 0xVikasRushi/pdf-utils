@@ -1,5 +1,6 @@
 use std::str;
-mod asn;
+pub mod pkcs7_signature;
+
 pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
     // Step 1: Find /ByteRange [
     let br_pos = pdf_bytes
