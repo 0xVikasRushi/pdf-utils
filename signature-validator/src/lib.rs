@@ -1,5 +1,5 @@
 use std::str;
-
+mod asn;
 pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
     // Step 1: Find /ByteRange [
     let br_pos = pdf_bytes
@@ -65,12 +65,6 @@ pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'stati
     signed_data.extend_from_slice(&pdf_bytes[offset2..offset2 + len2]);
 
     // Step 6: Find /Contents
-    // Extract hex data as before
-    let br_pos = pdf_bytes
-        .windows(b"/ByteRange".len())
-        .position(|w| w == b"/ByteRange")
-        .ok_or("ByteRange not found")?;
-
     let contents_marker = b"/Contents";
     let contents_pos = pdf_bytes[br_pos..]
         .windows(contents_marker.len())
@@ -117,14 +111,17 @@ pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'stati
 
 #[cfg(test)]
 mod tests {
+    use sha1::Digest;
+
     use super::*;
     use std::fs;
 
-    #[test]
+    // #[test]
     fn test_valid_signature() {
         let pdf_bytes =
             fs::read("../sample-pdfs/digitally_signed.pdf").expect("Failed to read PDF file");
-        let (signature_der, _) = get_signature_der(&pdf_bytes).expect("Failed to get signed data");
+        let (signature_der, signed_data) =
+            get_signature_der(&pdf_bytes).expect("Failed to get signed data");
 
         let expected_signature_bytes = fs::read("../sample-pdfs/digitally_signed_ber.txt")
             .expect("Failed to read expected signature DER file");
@@ -132,6 +129,12 @@ mod tests {
             .expect("Failed to convert signature DER to UTF-8")
             .trim()
             .to_string();
+
+        // hash the signed_data with sha1
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(&signed_data);
+        let hash = hasher.finalize();
+        dbg!(hex::encode(&hash));
 
         assert_eq!(expected_signature, hex::encode(&signature_der))
     }
