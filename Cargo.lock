@@ -403,6 +403,8 @@ name = "signature-validator"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "num-bigint",
+ "num-traits",
  "rsa",
  "sha1",
  "sha2",

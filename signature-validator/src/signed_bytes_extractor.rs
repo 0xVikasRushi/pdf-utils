@@ -74,32 +74,61 @@ pub fn get_signature_der(pdf_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'stati
 mod tests {
     use super::*;
     use sha1::Digest;
-    use std::fs;
+    use sha2::Sha256;
 
+    static SAMPLE_PDF_BYTES: &[u8] = include_bytes!("../../sample-pdfs/digitally_signed.pdf");
+    static BANK_PDF_BYTES: &[u8] = include_bytes!("../../samples-private/bank-cert.pdf");
+    static PAN_PDF_BYTES: &[u8] = include_bytes!("../../samples-private/pan-cert.pdf");
+    static EXPECTED_SIG_BYTES: &[u8] = include_bytes!("../../sample-pdfs/digitally_signed_ber.txt");
     #[test]
-    fn test_signed_bytes() {
-        let pdf_bytes =
-            fs::read("../sample-pdfs/digitally_signed.pdf").expect("Failed to read PDF file");
+    fn sample_pdf_signature_and_hash() {
         let (signature_der, signed_data) =
-            get_signature_der(&pdf_bytes).expect("Failed to get signed data");
+            get_signature_der(&SAMPLE_PDF_BYTES).expect("Failed to get signed data");
 
-        let expected_signature_bytes = fs::read("../sample-pdfs/digitally_signed_ber.txt")
-            .expect("Failed to read expected signature DER file");
-        let expected_signature = str::from_utf8(&expected_signature_bytes)
+        let expected_signature = std::str::from_utf8(&EXPECTED_SIG_BYTES)
             .expect("Failed to convert signature DER to UTF-8")
             .trim()
             .to_string();
 
-        // hash the signed_data with sha1
         let mut hasher = sha1::Sha1::new();
         hasher.update(&signed_data);
         let hash = hasher.finalize();
 
         assert_eq!(
-            hex::encode(&hash).to_string(),
+            hex::encode(&hash),
             "3f0047e6cb5b9bb089254b20d174445c3ba4f513"
         );
 
         assert_eq!(expected_signature, hex::encode(&signature_der));
+    }
+
+    #[test]
+    fn bank_pdf_sha256_hash() {
+        let (_, signed_data) =
+            get_signature_der(BANK_PDF_BYTES).expect("failed to extract signed data");
+
+        let mut hasher = Sha256::new();
+        hasher.update(&signed_data);
+        let digest = hasher.finalize();
+
+        assert_eq!(
+            hex::encode(digest),
+            "8f4a45720f3076fe51cc4fd1b5b23387fa6bbfb463262e6095e3af62a039dea1"
+        );
+    }
+
+    #[test]
+    fn pan_pdf_sha256_hash() {
+        let (_, signed_data) =
+            get_signature_der(PAN_PDF_BYTES).expect("failed to extract signed data");
+
+        let mut hasher = Sha256::new();
+        hasher.update(&signed_data);
+        let digest = hasher.finalize();
+
+        assert_eq!(
+            hex::encode(digest),
+            "a6c81c2d89d36a174273a4faa06fcfc91db574f572cfdf3a6518d08fb4eb4155"
+        );
     }
 }

@@ -1,35 +1,198 @@
-use hex::encode;
-use rsa::BigUint;
-use simple_asn1::{from_der, oid, ASN1Block, ASN1Class, OID};
+use std::error::Error;
 
-pub struct SignedDataInfo {
-    pub modulus: String,
+use num_bigint::BigUint;
+use num_traits::FromPrimitive;
+use sha2::{Digest, Sha256, Sha384, Sha512};
+use simple_asn1::{from_der, oid, ASN1Block, ASN1Class};
+
+use crate::SignatureAlgorithm;
+
+pub struct VerifierParams {
+    pub modulus: Vec<u8>,
     pub exponent: BigUint,
-    pub signature: String,
-    pub algorithm: String,
+    pub signature: Vec<u8>,
+    pub signed_attr_digest: Vec<u8>,
+    pub algorithm: SignatureAlgorithm,
+    pub signed_data_message_digest: Vec<u8>,
 }
 
-pub fn parse_signed_data(der_bytes: &[u8]) -> Result<SignedDataInfo, String> {
+pub fn parse_signed_data(der_bytes: &[u8]) -> Result<VerifierParams, String> {
     let blocks = from_der(der_bytes).map_err(|e| format!("DER parse error: {}", e))?;
 
     let content_info = extract_content_info(&blocks)?;
     let signed_children = extract_signed_children(content_info)?;
+    let (signature, signer_serial, digest_bytes, signed_algo, expected_message_digest) =
+        get_signature(signed_children.clone())?;
 
-    let (modulus_bytes, exponent_big) = extract_pubkey_components(&signed_children)?;
-    let signer_fields = extract_signer_fields(&signed_children)?;
+    let (modulus_bytes, exponent_big) =
+        extract_pubkey_components(&signed_children, &signer_serial)?;
 
-    let sig_alg_oid = extract_signature_oid(&signer_fields)?;
-    let alg_name = resolve_algorithm(&sig_alg_oid, &signed_children);
-    let signature = extract_signature(&signer_fields)?;
-
-    Ok(SignedDataInfo {
-        modulus: encode(&modulus_bytes),
+    Ok(VerifierParams {
+        modulus: modulus_bytes,
         exponent: exponent_big,
         signature,
-        algorithm: alg_name.to_string(),
+        signed_attr_digest: digest_bytes,
+        algorithm: signed_algo,
+        signed_data_message_digest: expected_message_digest,
     })
 }
 
+fn get_signature(
+    signed_data_seq: Vec<ASN1Block>,
+) -> Result<(Vec<u8>, BigUint, Vec<u8>, SignatureAlgorithm, Vec<u8>), String> {
+    // first last item of SignedData is signerInfos
+    let signer_info = match &signed_data_seq.last() {
+        Some(ASN1Block::Set(_, items)) => items,
+        _ => return Err("Expected SignerInfo in SignedData".into()),
+    };
+
+    // SignerInfo ::= SEQUENCE {
+    // version
+    // issuerAndSerialNumber
+    // digestAlgorithm
+    // signedAttributes
+    // signatureAlgorithm
+    // signature
+    // }
+
+    let signer_info = match &signer_info[0] {
+        ASN1Block::Sequence(_, items) => items,
+        _ => return Err("Expected SignerInfo in SignedData".into()),
+    };
+
+    // issuerAndSerialNumber ::= SEQUENCE { issuer Name, serialNumber INTEGER }
+    let (_, signer_serial) = match &signer_info[1] {
+        ASN1Block::Sequence(_, parts) if parts.len() == 2 => {
+            // Extract issuer (a SEQUENCE of RDNs)
+            let issuer = match &parts[0] {
+                ASN1Block::Sequence(_, seq) => seq.clone(),
+                other => return Err(format!("Expected issuer SEQUENCE, got {:?}", other).into()),
+            };
+
+            // Extract serialNumber and convert to BigUint
+            let serial = match &parts[1] {
+                ASN1Block::Integer(_, big_int) => {
+                    BigUint::from_bytes_be(&big_int.to_signed_bytes_be())
+                }
+                other => {
+                    return Err(format!("Expected serialNumber INTEGER, got {:?}", other).into())
+                }
+            };
+
+            (issuer, serial)
+        }
+        other => {
+            return Err(format!("Expected issuerAndSerialNumber SEQUENCE, got {:?}", other).into())
+        }
+    };
+
+    let digest_oid = if let ASN1Block::Sequence(_, items) = &signer_info[2] {
+        if let ASN1Block::ObjectIdentifier(_, oid) = &items[0] {
+            oid.clone()
+        } else {
+            return Err("Invalid digestAlgorithm in SignerInfo".into());
+        }
+    } else {
+        return Err("Digest algorithm missing".into());
+    };
+
+    let mut signed_attrs_der: Option<Vec<u8>> = None;
+    for block in signer_info {
+        match block {
+            // Match the IMPLICIT [0] block
+            ASN1Block::Unknown(ASN1Class::ContextSpecific, true, _len, tag_no, content) => {
+                match tag_no == &BigUint::from(0u8) {
+                    true => {
+                        // Build universal SET tag + length
+                        let mut out = Vec::with_capacity(content.len() + 4);
+                        out.push(0x31); // SET
+
+                        let len = content.len();
+                        if len < 128 {
+                            out.push(len as u8);
+                        } else if len <= 0xFF {
+                            out.push(0x81);
+                            out.push(len as u8);
+                        } else {
+                            out.push(0x82);
+                            out.push((len >> 8) as u8);
+                            out.push((len & 0xFF) as u8);
+                        }
+
+                        out.extend_from_slice(content);
+
+                        signed_attrs_der = Some(out);
+                        break;
+                    }
+                    false => {
+                        continue;
+                    }
+                }
+            }
+
+            // All other blocks: skip
+            _ => continue,
+        }
+    }
+
+    let signed_attrs_der = match signed_attrs_der {
+        Some(v) => v,
+        None => return Err("signedAttrs [0] not found".into()),
+    };
+
+    let signed_algo: SignatureAlgorithm;
+    // Compute the hash of the DER-encoded signedAttrs according to digest_oid
+    let digest_bytes = match digest_oid {
+        oid if oid == oid!(2, 16, 840, 1, 101, 3, 4, 2, 1) => {
+            // SHA-256
+            signed_algo = SignatureAlgorithm::Sha256WithRsaEncryption;
+            let mut h = Sha256::new();
+            h.update(&signed_attrs_der);
+            h.finalize().to_vec()
+        }
+        oid if oid == oid!(2, 16, 840, 1, 101, 3, 4, 2, 2) => {
+            // SHA-384
+            signed_algo = SignatureAlgorithm::Sha384WithRsaEncryption;
+            let mut h = Sha384::new();
+            h.update(&signed_attrs_der);
+            h.finalize().to_vec()
+        }
+        oid if oid == oid!(2, 16, 840, 1, 101, 3, 4, 2, 3) => {
+            // SHA-512
+            signed_algo = SignatureAlgorithm::Sha512WithRsaEncryption;
+            let mut h = Sha512::new();
+            h.update(&signed_attrs_der);
+            h.finalize().to_vec()
+        }
+        oid if oid == oid!(1, 3, 14, 3, 2, 26) => {
+            // SHA-1
+            signed_algo = SignatureAlgorithm::Sha1WithRsaEncryption;
+            let mut h = sha1::Sha1::new();
+            h.update(&signed_attrs_der);
+            h.finalize().to_vec()
+        }
+        _ => return Err(format!("Unsupported digest OID").into()),
+    };
+
+    let signed_attrs =
+        from_der(&signed_attrs_der).map_err(|e| format!("signedAttrs parse error: {}", e))?;
+
+    let signed_data_message_digest = extract_message_digest(&signed_attrs)
+        .map_err(|e| format!("Failed to get messageDigest: {}", e))?;
+    let sig_index = if digest_bytes.is_empty() { 4 } else { 5 };
+    let signature_bytes = if let ASN1Block::OctetString(_, s) = &signer_info[sig_index] {
+        s.clone()
+    } else {
+        return Err("EncryptedDigest (signature) not found".into());
+    };
+    Ok((
+        signature_bytes,
+        signer_serial,
+        digest_bytes,
+        signed_algo,
+        signed_data_message_digest,
+    ))
+}
 fn extract_content_info(blocks: &[ASN1Block]) -> Result<&[ASN1Block], String> {
     if let Some(ASN1Block::Sequence(_, children)) = blocks.get(0) {
         // Verify contentType is signedData OID
@@ -46,7 +209,7 @@ fn extract_content_info(blocks: &[ASN1Block]) -> Result<&[ASN1Block], String> {
     }
 }
 
-fn extract_signed_children(children: &[ASN1Block]) -> Result<Vec<ASN1Block>, String> {
+pub fn extract_signed_children(children: &[ASN1Block]) -> Result<Vec<ASN1Block>, String> {
     let block = children
         .get(1)
         .ok_or_else(|| "Missing SignedData content".to_string())?;
@@ -73,48 +236,95 @@ fn extract_signed_children(children: &[ASN1Block]) -> Result<Vec<ASN1Block>, Str
     }
 }
 
-/// Extract both modulus and exponent from the RSA public key
-fn extract_pubkey_components(children: &[ASN1Block]) -> Result<(Vec<u8>, BigUint), String> {
-    // Navigate to the certificates block (usually second to last element)
-    let cert_block = children
-        .get(children.len().saturating_sub(2))
-        .ok_or_else(|| "Certificates block not found".to_string())?;
-
-    let certs = match cert_block {
-        ASN1Block::Unknown(ASN1Class::ContextSpecific, _, _, _, data) => {
-            let parsed = from_der(data).map_err(|e| format!("Cert wrapper parse error: {}", e))?;
-            match &parsed[0] {
-                ASN1Block::Set(_, items) => items.clone(),
-                ASN1Block::Sequence(_, single) => vec![ASN1Block::Sequence(0, single.clone())],
-                _ => return Err("Unexpected cert wrapper content".into()),
-            }
+pub fn extract_pubkey_components(
+    signed_data_seq: &Vec<ASN1Block>,
+    signed_serial_number: &BigUint,
+) -> Result<(Vec<u8>, BigUint), String> {
+    // Find the certificates [0] IMPLICIT (may be Explicit or Unknown in parsing)
+    let certs_block = signed_data_seq.iter().find(|block| match block {
+        ASN1Block::Explicit(ASN1Class::ContextSpecific, _, tag, _) => {
+            tag == &simple_asn1::BigUint::from_usize(0).unwrap()
         }
-        ASN1Block::Set(_, items) => items.clone(),
-        ASN1Block::Explicit(ASN1Class::ContextSpecific, _, _, inner) => {
-            if let ASN1Block::Sequence(_, items) = &**inner {
+        ASN1Block::Unknown(ASN1Class::ContextSpecific, _, _, tag, _) => {
+            tag == &simple_asn1::BigUint::from_usize(0).unwrap()
+        }
+        _ => false,
+    });
+
+    // Extract the Vec<ASN1Block> containing the individual certificate SEQUENCEs
+    let certificates: Vec<ASN1Block> = match certs_block {
+        Some(cert_block) => match cert_block {
+            // 1) Implicit [0] IMPLICIT SET/SEQUENCE OF Certificate
+            ASN1Block::Unknown(ASN1Class::ContextSpecific, _, _, tag, data)
+                if tag == &BigUint::from(0u8) =>
+            {
+                // Parse the inner content which should be the SEQUENCEs/SET
+                let parsed_inner =
+                    from_der(data).map_err(|e| format!("Cert wrapper parse error: {}", e))?;
+                // Match on the entire parsed_inner
+                match parsed_inner.as_slice() {
+                    // a) single SET of certificates
+                    [ASN1Block::Set(_, items)] => items.clone(),
+
+                    // b) single SEQUENCE of certificates
+                    [ASN1Block::Sequence(_, items)] => items.clone(),
+
+                    // c) multiple back-to-back SEQUENCEs (each a cert)
+                    seqs if seqs.iter().all(|b| matches!(b, ASN1Block::Sequence(_, _))) => {
+                        seqs.to_vec()
+                    }
+
+                    other => {
+                        return Err(format!(
+                            "Unexpected structure inside implicit certificate block: {:?}",
+                            other
+                        )
+                        .into())
+                    }
+                }
+            }
+
+            // 2) Explicit [0] EXPLICIT SET/SEQUENCE OF Certificate
+            ASN1Block::Explicit(ASN1Class::ContextSpecific, _, tag, inner)
+                if tag == &BigUint::from(0u8) =>
+            {
+                match inner.as_ref() {
+                    ASN1Block::Set(_, certs) => certs.clone(),
+
+                    ASN1Block::Sequence(tag, fields) => {
+                        vec![ASN1Block::Sequence(*tag, fields.clone())]
+                    }
+
+                    other => {
+                        return Err(format!(
+                            "Expected SET or SEQUENCE inside Explicit certificate block, got {:?}",
+                            other
+                        )
+                        .into())
+                    }
+                }
+            }
+
+            // 3) bare SET OF Certificate
+            ASN1Block::Set(_, items)
+                if items.iter().all(|i| matches!(i, ASN1Block::Sequence(_, _))) =>
+            {
                 items.clone()
-            } else {
-                return Err("Explicit cert block not SEQUENCE".into());
             }
-        }
-        other => return Err(format!("Unexpected certificates block: {:?}", other)),
+
+            other => return Err(format!("Unexpected certificates block type: {:?}", other).into()),
+        },
+        None => Vec::new(),
     };
 
-    // Take first certificate and drill into tbsCertificate (child[0])
-    let cert_fields = if let ASN1Block::Sequence(_, fields) = &certs[0] {
-        fields
-    } else {
-        return Err("Certificate not a SEQUENCE".into());
+    // tbsCertificate (child[0])
+    let tbs_fields = get_correct_tbs(&certificates, &signed_serial_number);
+
+    let tbs_fields = match tbs_fields {
+        Ok(fields) => fields,
+        Err(e) => return Err(format!("Failed to get correct tbsCertificate: {}", e).into()),
     };
 
-    //tbsCertificate (child[0])
-    let tbs_fields = match &cert_fields[0] {
-        ASN1Block::Explicit(ASN1Class::ContextSpecific, _, _, _) => cert_fields.clone(),
-        ASN1Block::Sequence(_, seq) => seq.clone(),
-        _ => return Err("tbsCertificate not found".into()),
-    };
-
-    // Find subjectPublicKeyInfo within tbsCertificate
     let spki_fields = tbs_fields
         .iter()
         .find_map(|b| {
@@ -160,135 +370,78 @@ fn extract_pubkey_components(children: &[ASN1Block]) -> Result<(Vec<u8>, BigUint
 
     Ok((modulus, exponent))
 }
-fn extract_signer_fields(children: &[ASN1Block]) -> Result<Vec<ASN1Block>, String> {
-    if let Some(ASN1Block::Set(_, items)) = children.last() {
-        if let ASN1Block::Sequence(_, fields) = &items[0] {
-            return Ok(fields.clone());
-        }
-    }
-    Err("SignerInfo SEQUENCE not found".into())
-}
 
-fn extract_signature_oid(fields: &[ASN1Block]) -> Result<OID, String> {
-    if let Some(ASN1Block::Sequence(_, alg_fields)) = fields.get(4) {
-        if let Some(ASN1Block::ObjectIdentifier(_, oid_val)) = alg_fields.get(0) {
-            return Ok(oid_val.clone());
-        }
-    }
-    Err("Signature algorithm OID missing".into())
-}
-
-fn extract_signature(fields: &[ASN1Block]) -> Result<String, String> {
-    let block = fields
-        .get(5)
-        .ok_or_else(|| "Signature block not found".to_string())?;
-    let bytes = match block {
-        ASN1Block::OctetString(_, bs) => bs,
-        ASN1Block::BitString(_, _, bs) => bs,
-        other => return Err(format!("Unexpected signature block: {:?}", other)),
-    };
-    Ok(encode(bytes))
-}
-
-fn resolve_algorithm(oid_val: &OID, children: &[ASN1Block]) -> &'static str {
-    use simple_asn1::oid;
-    let rsa_enc = oid!(1, 2, 840, 113549, 1, 1, 1);
-    let sha1_rsa = oid!(1, 2, 840, 113549, 1, 1, 5);
-    let sha256_rsa = oid!(1, 2, 840, 113549, 1, 1, 11);
-    let sha384_rsa = oid!(1, 2, 840, 113549, 1, 1, 12);
-    let sha512_rsa = oid!(1, 2, 840, 113549, 1, 1, 13);
-    let sha224_rsa = oid!(1, 2, 840, 113549, 1, 1, 14);
-
-    // Try to extract digest OID from digestAlgorithms SET
-    let digest_oid = if let Some(ASN1Block::Set(_, algs)) = children.get(1) {
-        if let Some(ASN1Block::Sequence(_, items)) = algs.get(0) {
-            if let Some(ASN1Block::ObjectIdentifier(_, d_oid)) = items.get(0) {
-                Some(d_oid.clone())
-            } else {
-                None
-            }
+fn get_correct_tbs(
+    certificates: &Vec<ASN1Block>,
+    signed_serial_number: &BigUint,
+) -> Result<Vec<ASN1Block>, Box<dyn Error>> {
+    // Iterate through each cert until we find the one with the matching serial
+    for certificate in certificates {
+        // 1) Ensure the certificate is a SEQUENCE
+        let cert_fields = if let ASN1Block::Sequence(_, fields) = certificate {
+            fields
         } else {
-            None
+            return Err("Certificate not a SEQUENCE".into());
+        };
+
+        // 2) Unwrap tbsCertificate: either an explicit [0] wrapper or a direct SEQUENCE
+        let tbs_fields = match &cert_fields[0] {
+            ASN1Block::Explicit(ASN1Class::ContextSpecific, _, _, _) => cert_fields.clone(),
+            ASN1Block::Sequence(_, seq) => seq.clone(),
+            _ => return Err("tbsCertificate not found".into()),
+        };
+
+        // 3) Extract the serialNumber (second field of tbsCertificate)
+        let serial_number = if let ASN1Block::Integer(_, big_int) = &tbs_fields[1] {
+            BigUint::from_bytes_be(&big_int.to_signed_bytes_be())
+        } else {
+            return Err("Serial number not found".into());
+        };
+
+        // 4) If it matches, return the tbsCertificate fields immediately
+        if serial_number == *signed_serial_number {
+            return Ok(tbs_fields);
+        }
+    }
+
+    // If we never found a match, that's an error
+    Err("No matching certificate found".into())
+}
+
+/// find and return the messageDigest OCTET STRING bytes.
+fn extract_message_digest(attrs: &[ASN1Block]) -> Result<Vec<u8>, String> {
+    // 1) If there's exactly one block and it's a SET, unwrap it to get at the SEQUENCEs.
+    let candidates: &[ASN1Block] = if attrs.len() == 1 {
+        if let ASN1Block::Set(_, inner) = &attrs[0] {
+            inner.as_slice()
+        } else {
+            attrs
         }
     } else {
-        None
+        attrs
     };
 
-    // Check combined signature OIDs first
-    if *oid_val == sha256_rsa {
-        "sha256WithRSAEncryption"
-    } else if *oid_val == sha384_rsa {
-        "sha384WithRSAEncryption"
-    } else if *oid_val == sha512_rsa {
-        "sha512WithRSAEncryption"
-    } else if *oid_val == sha1_rsa {
-        "sha1WithRSAEncryption"
-    } else if *oid_val == sha224_rsa {
-        "sha224WithRSAEncryption"
-    } else if *oid_val == rsa_enc {
-        // Infer from digestAlgorithms OID
-        if let Some(d) = digest_oid {
-            if d == oid!(2, 16, 840, 1, 101, 3, 4, 2, 1) {
-                "sha256WithRSAEncryption"
-            } else if d == oid!(2, 16, 840, 1, 101, 3, 4, 2, 2) {
-                "sha384WithRSAEncryption"
-            } else if d == oid!(2, 16, 840, 1, 101, 3, 4, 2, 3) {
-                "sha512WithRSAEncryption"
-            } else if d == oid!(1, 3, 14, 3, 2, 26) {
-                "sha1WithRSAEncryption"
-            } else if d == oid!(2, 16, 840, 1, 101, 3, 4, 2, 4) {
-                "sha224WithRSAEncryption"
-            } else {
-                "rsaEncryption (unknown hash)"
+    // 2) Now each `attr` should be a Sequence([OID, Set([OctetString, …])])
+    for attr in candidates {
+        if let ASN1Block::Sequence(_, items) = attr {
+            // items[0] = OID, items[1] = Set(_)
+            if let ASN1Block::ObjectIdentifier(_, oid) = &items[0] {
+                if *oid == oid!(1, 2, 840, 113549, 1, 9, 4) {
+                    // pull the inner Set
+                    if let ASN1Block::Set(_, inner_vals) = &items[1] {
+                        // expect the first value to be an OctetString
+                        if let ASN1Block::OctetString(_, data) = &inner_vals[0] {
+                            return Ok(data.clone());
+                        } else {
+                            return Err("messageDigest value not an OctetString".into());
+                        }
+                    } else {
+                        return Err("messageDigest missing inner Set".into());
+                    }
+                }
             }
-        } else {
-            "rsaEncryption"
         }
-    } else {
-        "UnknownSignatureAlgorithm"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use crate::{
-        pkcs7_signature::{parse_signed_data, SignedDataInfo},
-        signed_bytes_extractor::get_signature_der,
-    };
-
-    #[test]
-    fn rsa_sha1_extraction() {
-        let pdf_bytes = fs::read("../sample-pdfs/digitally_signed.pdf")
-            .expect("Failed to read digitally_signed.pdf");
-
-        let (der, signed_data) = get_signature_der(&pdf_bytes).expect("Failed to get signed data");
-
-        let SignedDataInfo {
-            signature: signature_hex,
-            algorithm: signature_algorithm,
-            modulus: modulus_hex,
-            exponent,
-        } = parse_signed_data(&der).expect("Failed to parse signed data");
-
-        assert_eq!(signature_algorithm, "sha1WithRSAEncryption")
     }
 
-    #[test]
-    fn rsa_sha256_extraction() {
-        // digital locked pdf
-        let pdf_bytes = fs::read("../samples-private/pan-cert.pdf")
-            .expect("Failed to read digitally_signed.pdf");
-
-        let (der, signed_data) = get_signature_der(&pdf_bytes).expect("Failed to get signed data");
-        let SignedDataInfo {
-            signature: signature_hex,
-            algorithm: signature_algorithm,
-            modulus: modulus_hex,
-            exponent,
-        } = parse_signed_data(&der).expect("Failed to parse signed data");
-
-        assert_eq!(signature_algorithm, "sha256WithRSAEncryption");
-    }
+    Err("messageDigest attribute (OID 1.2.840.113549.1.9.4) not found".into())
 }
