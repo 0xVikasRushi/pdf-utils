@@ -1,7 +1,7 @@
-pub mod pkcs7_signature;
+pub mod pkcs7_parser;
 pub mod signed_bytes_extractor;
 
-use pkcs7_signature::{parse_signed_data, VerifierParams};
+use pkcs7_parser::{parse_signed_data, VerifierParams};
 use rsa::{Pkcs1v15Sign, RsaPublicKey};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
