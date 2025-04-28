@@ -1,5 +1,6 @@
 use miniz_oxide::inflate::decompress_to_vec_zlib;
-
+// mod chat;
+mod extractor;
 pub fn decompress_to_utf8(compressed_data: &[u8]) -> Result<String, &'static str> {
     let decompressed =
         decompress_to_vec_zlib(compressed_data).map_err(|_| "Failed to decompress")?;
